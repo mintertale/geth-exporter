@@ -4,7 +4,7 @@ After=geth.service
 
 [Service]
 EnvironmentFile=/etc/default/geth-exporter
-ExecStartPre=/bin/sleep 10
+ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/geth-exporter
 Restart=on-failure
 RestartSec=30

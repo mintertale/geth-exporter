@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
-from distutils.core import setup
+try:
+    from setuptools import setup, find_packages
+except ImportError:
+    from distutils.core import setup, find_packages
 
 setup(name='geth-exporter',
-      version='{{VERSION}}',
+      version='2',
       description='go-Ethereum exporter for Prometheus',
       author='Alexandru Thomae',
-      author_email='<alex@thom.ae>',
+      author_email='<alex@thom.ae> and <mintertale',
       scripts=['geth-exporter'],
-      url='https://gitlab.ix.ai/altcoins/geth-exporter',
+      url='https://github.com/mintertale/geth-exporter',
       )
