@@ -1,0 +1,252 @@
+#!/usr/bin/python3
+
+import argparse
+import logging
+import time
+import os
+import yaml
+import sys
+import requests
+from web3 import Web3, HTTPProvider
+from prometheus_client import write_to_textfile, start_http_server
+from prometheus_client.core import REGISTRY, GaugeMetricFamily, CounterMetricFamily
+from yaml.loader import SafeLoader
+from datetime import datetime
+
+log = logging.getLogger(__name__)
+logging.basicConfig(stream=sys.stdout, level=os.environ.get("LOGLEVEL", "WARNING"))
+
+settings = {}
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--host', help='Host address of RPC interface to scrape from.', default=argparse.SUPPRESS)
+parser.add_argument('--port', help='Port of the host.', default=argparse.SUPPRESS)
+parser.add_argument('--interval', help='Scrape interval.', default=argparse.SUPPRESS)
+parser.add_argument('--export-type', help='The output type; choose text or http.', choices=['text', 'http'], default=argparse.SUPPRESS)
+parser.add_argument('--service-port', help="The port on which we'll serve our /metrics endpoint", default=argparse.SUPPRESS)
+parser.add_argument('--prom-folder', help='Defaults to /var/lib/node_exporter.', default=argparse.SUPPRESS)
+args = vars(parser.parse_args())
+
+
+def _settings():
+    global settings
+
+    settings = {
+        'geth_exporter': {
+            'prom_folder': '/var/lib/node_exporter',
+            'interval': 60,
+            'geth_host': 'localhost',
+            'geth_port': 8485,
+            'additional_accounts': [],
+            'enable_accounts': 'off',
+            'export': 'http',
+            'listen_port': 9305,
+        },
+    }
+    config_file = '/etc/geth-exporter/geth-exporter.yaml'
+    cfg = {}
+    if os.path.isfile(config_file):
+        with open(config_file, 'r') as ymlfile:
+            cfg = yaml.load(ymlfile, Loader=SafeLoader)
+            cfg = cfg.get('geth_exporter', {})
+
+    if cfg:
+        for key, value in cfg.items():
+            if key == 'export' and value not in ('text', 'http'):
+                continue
+            if key == 'enable_accounts' and value not in ('on', 'off'):
+                continue
+            settings['geth_exporter'][key] = value
+
+    # CLI flags override defaults and config
+    for key, value in args.items():
+        settings['geth_exporter'][key] = value
+
+
+class EthereumCollector:
+    def collect(self):
+        metrics = {
+            'geth_current_block': GaugeMetricFamily('geth_block_number', 'The number of the most recent block'),
+            'geth_gas_price_wei': GaugeMetricFamily('geth_gas_price_wei', 'The current gas price in Wei'),
+            'geth_mining': GaugeMetricFamily('geth_mining', 'Boolean mining status'),
+            'geth_hash_rate': GaugeMetricFamily('geth_hash_rate','The current number of hashes per second the node is mining with'),
+            'geth_syncing': GaugeMetricFamily('geth_syncing', 'Boolean syncing status'),
+            'geth_time_from_lastblock': GaugeMetricFamily('geth_time_from_lastblock', 'Timestamp'),
+            'geth_gasLimit': GaugeMetricFamily('geth_gasLimit', 'gas limit'),
+            'geth_gasUsed': GaugeMetricFamily('geth_gasUsed', 'gas used'),
+            'geth_size': GaugeMetricFamily('geth_size', 'size')
+        }
+        if settings['geth_exporter']['enable_accounts'] == 'on':
+            metrics.update({
+                'account_balance': GaugeMetricFamily(
+                    'account_balance',
+                    'Account Balance',
+                    labels=['currency', 'account', 'type']
+                ),
+            })
+
+        web3 = Web3(HTTPProvider(f"http://{settings['geth_exporter']['geth_host']}:{int(settings['geth_exporter']['geth_port'])}"
+
+        ))
+
+        if web3:
+            if settings['geth_exporter']['enable_accounts'] == 'on':
+                accounts = set(web3.eth.accounts)
+                for additional_account in settings['geth_exporter']['additional_accounts']:
+                    accounts.add(additional_account)
+                log.debug('Exporting metrics for the following accounts: {acc}'.format(acc=accounts))
+                for account in accounts:
+                    # metric: geth_account_balance
+                    try:
+                        metrics['account_balance'].add_metric(
+                            labels=['ETH', account, 'geth'],
+                            value=web3.fromWei(web3.eth.getBalance(account), 'ether')
+                        )
+                    except (
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.ReadTimeout
+                    ) as e:
+                        log.warning("Can't connect to geth. The error received follows.")
+                        log.warning(e)
+
+            # metric: geth_current_block
+            try:
+                metrics['geth_current_block'].add_metric(value=web3.eth.blockNumber, labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_current_block. The error received follows.")
+                log.warning(e)
+
+            # metric: geth_time_from_lastblock
+            try:# Getting the current date and time
+                metrics['geth_time_from_lastblock'].add_metric(value=int(datetime.timestamp(datetime.now()))-int(web3.eth.get_block('latest')['timestamp']), labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_time_from_lastblock. The error received follows.")
+                log.warning(e)
+
+
+            # metric: geth_gasLimit
+            try:# Getting the current date and time
+                metrics['geth_gasLimit'].add_metric(value=web3.eth.get_block('latest')['gasLimit'], labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_gaslimit. The error received follows.")
+                log.warning(e)
+
+            # metric: geth_gasUsed
+            try:# Getting the current date and time
+                metrics['geth_gasUsed'].add_metric(value=web3.eth.get_block('latest')['gasUsed'], labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_gaslimit. The error received follows.")
+                log.warning(e)
+
+            # metric: geth_size
+            try:# Getting the current date and time
+                metrics['geth_size'].add_metric(value=web3.eth.get_block('latest')['size'], labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_size. The error received follows.")
+                log.warning(e)
+
+            # metric: geth_gas_price_wei
+            try:
+                metrics['geth_gas_price_wei'].add_metric(value=web3.eth.gasPrice, labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_gas_price_wei. The error received follows.")
+                log.warning(e)
+
+            # metric: geth_mining
+            # metric: geth_hash_rate
+            try:
+                if web3.eth.mining:
+                    metrics['geth_mining'].add_metric(value=1, labels=[])
+                    metrics['geth_hash_rate'].add_metric(value=web3.eth.hashrate, labels=[])
+                else:
+                    metrics['geth_mining'].add_metric(value=0, labels=[])
+                    metrics['geth_hash_rate'].add_metric(value=0, labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_mining or geth_hash_rate. The error received follows.")
+                log.warning(e)
+
+            # metric: geth_syncing
+            try:
+                if web3.eth.syncing:
+                    metrics['geth_syncing'].add_metric(value=1, labels=[])
+                else:
+                    metrics['geth_syncing'].add_metric(value=0, labels=[])
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout
+            ) as e:
+                log.warning("Can't connect to geth. The error received follows.")
+                log.warning(e)
+            except ValueError as e:
+                log.warning("Can't get the value for geth_syncing. The error received follows.")
+                log.warning(e)
+
+        web3 = None
+
+        for m in metrics.values():
+            yield m
+
+
+def _collect_to_text():
+    while True:
+        e = EthereumCollector()
+        write_to_textfile('{0}/geth-exporter.prom'.format(settings['geth_exporter']['prom_folder']), e)
+        time.sleep(int(settings['geth_exporter']['interval']))
+
+
+def _collect_to_http():
+    start_http_server(int(settings['geth_exporter']['listen_port']))
+    while True:
+        time.sleep(int(1))
+
+
+if __name__ == '__main__':
+    _settings()
+    log.debug('Loaded settings: {}'.format(settings))
+    REGISTRY.register(EthereumCollector())
+    if settings['geth_exporter']['export'] == 'text':
+        _collect_to_text()
+    if settings['geth_exporter']['export'] == 'http':
+        _collect_to_http()
